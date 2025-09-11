@@ -15,9 +15,8 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# --- Flask App for Koyeb Health Check ---
+# --- Flask App for Health Check ---
 app = Flask(__name__)
-
 @app.route('/')
 def health():
     return "OK", 200
@@ -85,8 +84,7 @@ def callback_handler(call):
         bot.send_message(chat_id, "📤 Send me the file URL.")
 
     elif call.data == "search":
-        bot.send_message(chat_id, "🔍 Search features unchanged for now.")
-        send_main_menu(chat_id)
+        choose_file_for_search(chat_id)
 
     elif call.data == "delete":
         links = user_data.get(chat_id, {}).get('links', {})
@@ -120,6 +118,16 @@ def callback_handler(call):
             bot.send_message(chat_id, msg, parse_mode="Markdown")
         send_main_menu(chat_id)
 
+    elif call.data.startswith("search_file:"):
+        chat_id = call.message.chat.id
+        fname = call.data.split("search_file:")[1]
+        if fname not in user_data[chat_id]['links']:
+            bot.send_message(chat_id, "⚠️ File not found.")
+            send_main_menu(chat_id)
+            return
+        user_states[chat_id] = f"awaiting_domain:{fname}"
+        bot.send_message(chat_id, f"🔍 Send the domain to search in file `{fname}`", parse_mode="Markdown")
+
 # --- Manual URL Upload (auto numbering, skip duplicates) ---
 @bot.message_handler(func=lambda m: user_states.get(m.chat.id) == 'awaiting_url')
 def handle_url(message):
@@ -130,7 +138,6 @@ def handle_url(message):
         return
 
     links = user_data[chat_id]['links']
-
     if url in links.values():
         bot.send_message(chat_id, "⚠️ This link is already saved.")
         user_states[chat_id] = None
@@ -156,7 +163,6 @@ def handle_forwarded_file(message):
     url = link_match.group(1).strip()
 
     links = user_data[chat_id]['links']
-
     if url in links.values():
         return  # skip duplicates
 
@@ -176,6 +182,70 @@ def handle_forwarded_file(message):
                 parse_mode="Markdown"
             )
             send_main_menu(chat_id)
+
+# --- Search One File ---
+def choose_file_for_search(chat_id):
+    links = user_data[chat_id]['links']
+    if not links:
+        bot.send_message(chat_id, "⚠️ No files available to search.")
+        send_main_menu(chat_id)
+        return
+    markup = types.InlineKeyboardMarkup()
+    for fname in links.keys():
+        markup.add(types.InlineKeyboardButton(f"🔍 {fname}", callback_data=f"search_file:{fname}"))
+    bot.send_message(chat_id, "Select a file to search:", reply_markup=markup)
+
+# --- Domain Input Handler ---
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, "").startswith("awaiting_domain:"))
+def handle_search_domain(message):
+    chat_id = message.chat.id
+    state = user_states[chat_id]
+    fname = state.split("awaiting_domain:")[1]
+    url = user_data[chat_id]['links'].get(fname)
+    if not url:
+        bot.send_message(chat_id, "⚠️ File URL not found.")
+        send_main_menu(chat_id)
+        return
+    domain = message.text.strip()
+    save_searched_domain(chat_id, domain)
+    stream_search_with_live_progress(chat_id, url, domain, fname)
+
+# --- Streaming Search ---
+def stream_search_with_live_progress(chat_id, url, target_domain, fname):
+    try:
+        progress_msg = bot.send_message(chat_id, f"⏳ Searching `{target_domain}` in `{fname}`...")
+        response = requests.get(url, stream=True, timeout=(10, 60))
+        response.raise_for_status()
+
+        found_lines_stream = io.BytesIO()
+        total_matches = 0
+        pattern = re.compile(re.escape(target_domain), re.IGNORECASE)
+
+        for line in response.iter_lines(decode_unicode=True):
+            if line and pattern.search(line):
+                found_lines_stream.write((line + "\n").encode("utf-8"))
+                total_matches += 1
+
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=progress_msg.message_id,
+            text=f"✅ Search complete — found {total_matches} matches"
+        )
+
+        if total_matches > 0:
+            found_lines_stream.seek(0)
+            bot.send_document(
+                chat_id,
+                found_lines_stream,
+                visible_file_name=f"search_results_{fname}_{target_domain}.txt",
+                caption=f"✅ Found {total_matches} matches for `{target_domain}` in `{fname}`",
+                parse_mode="Markdown"
+            )
+
+    except Exception as e:
+        bot.send_message(chat_id, f"⚠️ Error: {e}")
+    finally:
+        send_main_menu(chat_id)
 
 # --- Run Flask + Bot ---
 if __name__ == '__main__':
