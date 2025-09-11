@@ -48,7 +48,8 @@ def send_main_menu(chat_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("📤 Add Link", callback_data="upload_file"),
-        types.InlineKeyboardButton("🔍 Search", callback_data="search"),
+        types.InlineKeyboardButton("🔍 Search One File", callback_data="search_one"),
+        types.InlineKeyboardButton("🔎 Search All Files", callback_data="search_all"),
         types.InlineKeyboardButton("🗑 Delete", callback_data="delete"),
         types.InlineKeyboardButton("📄 List Files", callback_data="list_files")
     )
@@ -83,8 +84,12 @@ def callback_handler(call):
         user_states[chat_id] = 'awaiting_url'
         bot.send_message(chat_id, "📤 Send me the file URL.")
 
-    elif call.data == "search":
+    elif call.data == "search_one":
         choose_file_for_search(chat_id)
+
+    elif call.data == "search_all":
+        user_states[chat_id] = 'awaiting_domain_all'
+        bot.send_message(chat_id, "🔎 Send the domain to search across all files.")
 
     elif call.data == "delete":
         links = user_data.get(chat_id, {}).get('links', {})
@@ -119,7 +124,6 @@ def callback_handler(call):
         send_main_menu(chat_id)
 
     elif call.data.startswith("search_file:"):
-        chat_id = call.message.chat.id
         fname = call.data.split("search_file:")[1]
         if fname not in user_data[chat_id]['links']:
             bot.send_message(chat_id, "⚠️ File not found.")
@@ -164,7 +168,7 @@ def handle_forwarded_file(message):
 
     links = user_data[chat_id]['links']
     if url in links.values():
-        return  # skip duplicates
+        return
 
     file_name = str(len(links) + 1)
     links[file_name] = url
@@ -195,7 +199,7 @@ def choose_file_for_search(chat_id):
         markup.add(types.InlineKeyboardButton(f"🔍 {fname}", callback_data=f"search_file:{fname}"))
     bot.send_message(chat_id, "Select a file to search:", reply_markup=markup)
 
-# --- Domain Input Handler ---
+# --- Domain Input for Single File ---
 @bot.message_handler(func=lambda m: user_states.get(m.chat.id, "").startswith("awaiting_domain:"))
 def handle_search_domain(message):
     chat_id = message.chat.id
@@ -208,44 +212,135 @@ def handle_search_domain(message):
         return
     domain = message.text.strip()
     save_searched_domain(chat_id, domain)
-    stream_search_with_live_progress(chat_id, url, domain, fname)
+    threading.Thread(target=stream_search_single, args=(chat_id, url, domain, fname)).start()
 
-# --- Streaming Search ---
-def stream_search_with_live_progress(chat_id, url, target_domain, fname):
+# --- Domain Input for All Files ---
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id) == "awaiting_domain_all")
+def handle_search_all(message):
+    chat_id = message.chat.id
+    domain = message.text.strip()
+    save_searched_domain(chat_id, domain)
+    threading.Thread(target=stream_search_all_files, args=(chat_id, domain)).start()
+
+# --- Stream search in single file ---
+def stream_search_single(chat_id, url, domain, fname):
     try:
-        progress_msg = bot.send_message(chat_id, f"⏳ Searching `{target_domain}` in `{fname}`...")
+        progress_msg = bot.send_message(chat_id, f"⏳ Searching `{domain}` in `{fname}`...")
         response = requests.get(url, stream=True, timeout=(10, 60))
         response.raise_for_status()
-
-        found_lines_stream = io.BytesIO()
+        found_lines = io.BytesIO()
         total_matches = 0
-        pattern = re.compile(re.escape(target_domain), re.IGNORECASE)
+        lines_processed = 0
+        pattern = re.compile(re.escape(domain), re.IGNORECASE)
+        last_percent = 0
+        total_bytes = int(response.headers.get('Content-Length', 0))
 
         for line in response.iter_lines(decode_unicode=True):
-            if line and pattern.search(line):
-                found_lines_stream.write((line + "\n").encode("utf-8"))
+            if not line:
+                continue
+            lines_processed += 1
+            if pattern.search(line):
+                found_lines.write((line + "\n").encode("utf-8"))
                 total_matches += 1
+
+            if total_bytes:
+                percent = int((lines_processed / max(lines_processed, 1)) * 100)
+                if percent >= last_percent + 5:
+                    bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=progress_msg.message_id,
+                        text=f"📊 {percent}% done — found {total_matches} matches"
+                    )
+                    last_percent = percent
 
         bot.edit_message_text(
             chat_id=chat_id,
             message_id=progress_msg.message_id,
             text=f"✅ Search complete — found {total_matches} matches"
         )
-
         if total_matches > 0:
-            found_lines_stream.seek(0)
+            found_lines.seek(0)
             bot.send_document(
                 chat_id,
-                found_lines_stream,
-                visible_file_name=f"search_results_{fname}_{target_domain}.txt",
-                caption=f"✅ Found {total_matches} matches for `{target_domain}` in `{fname}`",
+                found_lines,
+                visible_file_name=f"search_results_{fname}_{domain}.txt",
+                caption=f"✅ Found {total_matches} matches in `{fname}`",
                 parse_mode="Markdown"
             )
-
     except Exception as e:
         bot.send_message(chat_id, f"⚠️ Error: {e}")
     finally:
         send_main_menu(chat_id)
+
+# --- Search Across All Files with Progress ---
+def stream_search_all_files(chat_id, domain):
+    links = user_data[chat_id]['links']
+    if not links:
+        bot.send_message(chat_id, "⚠️ No files to search.")
+        send_main_menu(chat_id)
+        return
+
+    progress_msg = bot.send_message(chat_id, f"⏳ Searching `{domain}` across {len(links)} files...")
+    found_lines = io.BytesIO()
+    total_matches = 0
+    total_lines = 0
+    file_lines_count = {}
+
+    # Count total lines for progress
+    for fname, url in links.items():
+        try:
+            resp = requests.get(url, stream=True, timeout=(10, 60))
+            resp.raise_for_status()
+            count = sum(1 for _ in resp.iter_lines(decode_unicode=True))
+            file_lines_count[fname] = count
+            total_lines += count
+        except:
+            file_lines_count[fname] = 0
+
+    lines_processed = 0
+    last_percent = 0
+    pattern = re.compile(re.escape(domain), re.IGNORECASE)
+
+    for fname, url in links.items():
+        try:
+            response = requests.get(url, stream=True, timeout=(10, 60))
+            response.raise_for_status()
+            for line in response.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                lines_processed += 1
+                if pattern.search(line):
+                    found_lines.write(f"[{fname}] {line}\n".encode("utf-8"))
+                    total_matches += 1
+
+                if total_lines:
+                    percent = int((lines_processed / total_lines) * 100)
+                    if percent >= last_percent + 5:
+                        bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=progress_msg.message_id,
+                            text=f"📊 {percent}% done — found {total_matches} matches"
+                        )
+                        last_percent = percent
+
+        except Exception as e:
+            bot.send_message(chat_id, f"⚠️ Error searching `{fname}`: {e}")
+
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=progress_msg.message_id,
+        text=f"✅ Search complete — found {total_matches} matches across all files"
+    )
+    if total_matches > 0:
+        found_lines.seek(0)
+        bot.send_document(
+            chat_id,
+            found_lines,
+            visible_file_name=f"search_all_{domain}.txt",
+            caption=f"✅ Found {total_matches} matches across all files",
+            parse_mode="Markdown"
+        )
+    send_main_menu(chat_id)
 
 # --- Run Flask + Bot ---
 if __name__ == '__main__':
