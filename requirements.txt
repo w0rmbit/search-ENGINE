@@ -1,1 +1,3 @@
-pip install telethon pyTelegramBotAPI flask requests
+pyTelegramBotAPI
+Flask
+requests
